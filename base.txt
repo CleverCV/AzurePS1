@@ -1,0 +1,40 @@
+AzurePS1/
+├── main.lua
+├── conf.lua
+├── README.md
+├── env.ps1
+│
+├── core/
+│   ├── cpu.lua
+│   ├── memory.lua
+│   ├── bios.lua
+│   ├── gpu.lua
+│   ├── gte.lua
+│   ├── spu.lua
+│   ├── cdrom.lua
+│   ├── controller.lua
+│   └── interrupts.lua
+│
+├── frontend/
+│   ├── renderer.lua
+│   ├── interface.lua
+│   ├── debugger.lua
+│   ├── audio.lua
+│   └── input.lua
+│
+├── shaders/
+│   ├── psx.glsl
+│   ├── crt.glsl
+│   └── texture.glsl
+│
+├── assets/
+│   ├── fonts/
+│   ├── icons/
+│   └── textures/
+│
+├── bios/
+├── games/
+├── tests/
+│
+└── l2/
+    └── love.exe
