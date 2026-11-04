@@ -1,0 +1,16 @@
+bios/*.BIN
+bios/*.bin
+bios/*.ROM
+bios/*.rom
+build/
+dist/
+*.log
+*.tmp
+*.bak
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
