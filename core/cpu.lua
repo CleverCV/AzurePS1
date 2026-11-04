@@ -1,4 +1,3 @@
-
 local bit = require("bit")
 
 local CPU = {}
@@ -6,30 +5,28 @@ CPU.__index = CPU
 
 local TWO32 = 4294967296
 
-local function signed16(value)
-    if value >= 0x8000 then
-        return value - 0x10000
-    end
-
-    return value
-end
-
 local function u32(value)
     return bit.tobit(value)
 end
 
 local function unsigned(value)
     local result = bit.band(value, 0xFFFFFFFF)
-
     if result < 0 then
         result = result + TWO32
     end
-
     return result
 end
 
 local function signed(value)
     return bit.tobit(value)
+end
+
+local function signed16(value)
+    value = bit.band(value, 0xFFFF)
+    if value >= 0x8000 then
+        return value - 0x10000
+    end
+    return value
 end
 
 local function multiplyUnsigned(a, b)
@@ -38,7 +35,6 @@ local function multiplyUnsigned(a, b)
 
     local a0 = a % 65536
     local a1 = math.floor(a / 65536)
-
     local b0 = b % 65536
     local b1 = math.floor(b / 65536)
 
@@ -65,11 +61,12 @@ local function multiplyUnsigned(a, b)
     return u32(low), u32(high)
 end
 
-function CPU.new(memory, interrupts)
+function CPU.new(memory, interrupts, gte)
     local self = setmetatable({}, CPU)
 
     self.memory = memory
     self.interrupts = interrupts
+    self.gte = gte
 
     self.registers = {}
     self.cop0 = {}
@@ -80,7 +77,6 @@ function CPU.new(memory, interrupts)
     end
 
     self.pc = 0xBFC00000
-
     self.hi = 0
     self.lo = 0
 
@@ -90,9 +86,15 @@ function CPU.new(memory, interrupts)
     self.halted = false
     self.running = false
 
+    self.last_error = nil
+
     self:reset()
 
     return self
+end
+
+function CPU:setGTE(gte)
+    self.gte = gte
 end
 
 function CPU:reset()
@@ -112,7 +114,8 @@ function CPU:reset()
     self.halted = false
     self.running = false
 
-    -- Estado inicial aproximado del COP0 de la PS1.
+    self.last_error = nil
+
     self.cop0[12] = u32(0x10900000)
     self.cop0[15] = 0x00000002
 end
@@ -142,6 +145,42 @@ function CPU:exception(code, in_delay_slot)
     self.pending_branch = nil
 end
 
+function CPU:interruptPending()
+    if not self.interrupts then
+        return false
+    end
+
+    if not self.interrupts.isPending then
+        return false
+    end
+
+    local status = self.cop0[12]
+    local cause = self.cop0[13]
+
+    local interruptEnable = bit.band(status, 1) ~= 0
+    local interruptMask = bit.band(
+        bit.rshift(status, 8),
+        0xFF
+    )
+
+    local pending = bit.band(
+        bit.rshift(cause, 8),
+        0xFF
+    )
+
+    return interruptEnable
+        and bit.band(interruptMask, pending) ~= 0
+end
+
+function CPU:checkInterrupt()
+    if not self:interruptPending() then
+        return false
+    end
+
+    self:exception(0, false)
+    return true
+end
+
 function CPU:execute(instruction)
     local op = bit.band(bit.rshift(instruction, 26), 0x3F)
 
@@ -168,7 +207,9 @@ function CPU:execute(instruction)
 
     local function branchIf(condition)
         if condition then
-            next_branch = u32(self.pc + 4 + simm * 4)
+            next_branch = u32(
+                self.pc + 4 + simm * 4
+            )
         end
     end
 
@@ -176,75 +217,60 @@ function CPU:execute(instruction)
         return u32(a + simm)
     end
 
-    -- =========================================================
-    -- SPECIAL
-    -- =========================================================
+    local function unsupported(message)
+        return nil, message
+    end
 
+    -- SPECIAL
     if op == 0x00 then
 
         if funct == 0x00 then
-            -- SLL
             write(rd, bit.lshift(b, shamt))
 
         elseif funct == 0x02 then
-            -- SRL
             write(rd, bit.rshift(b, shamt))
 
         elseif funct == 0x03 then
-            -- SRA
             write(rd, bit.arshift(b, shamt))
 
         elseif funct == 0x04 then
-            -- SLLV
             write(rd, bit.lshift(b, bit.band(a, 31)))
 
         elseif funct == 0x06 then
-            -- SRLV
             write(rd, bit.rshift(b, bit.band(a, 31)))
 
         elseif funct == 0x07 then
-            -- SRAV
             write(rd, bit.arshift(b, bit.band(a, 31)))
 
         elseif funct == 0x08 then
-            -- JR
             next_branch = u32(a)
 
         elseif funct == 0x09 then
-            -- JALR
             write(rd == 0 and 31 or rd, self.pc + 8)
             next_branch = u32(a)
 
         elseif funct == 0x0C then
-            -- SYSCALL
             return nil, nil, 8
 
         elseif funct == 0x0D then
-            -- BREAK
             return nil, nil, 9
 
         elseif funct == 0x0F then
             -- SYNC
-            -- No requiere operación adicional en esta implementación.
 
         elseif funct == 0x10 then
-            -- MFHI
             write(rd, self.hi)
 
         elseif funct == 0x11 then
-            -- MTHI
             self.hi = u32(b)
 
         elseif funct == 0x12 then
-            -- MFLO
             write(rd, self.lo)
 
         elseif funct == 0x13 then
-            -- MTLO
             self.lo = u32(b)
 
         elseif funct == 0x18 then
-            -- MULT
             local low, high = multiplyUnsigned(a, b)
 
             local ua = unsigned(a)
@@ -262,14 +288,11 @@ function CPU:execute(instruction)
             self.hi = high
 
         elseif funct == 0x19 then
-            -- MULTU
             local low, high = multiplyUnsigned(a, b)
-
             self.lo = low
             self.hi = high
 
         elseif funct == 0x1A then
-            -- DIV
             if b == 0 then
                 self.lo = a < 0 and 1 or -1
                 self.hi = u32(a)
@@ -280,13 +303,11 @@ function CPU:execute(instruction)
 
             else
                 local quotient = math.modf(a / b)
-
                 self.lo = u32(quotient)
                 self.hi = u32(a - quotient * b)
             end
 
         elseif funct == 0x1B then
-            -- DIVU
             local ua = unsigned(a)
             local ub = unsigned(b)
 
@@ -307,176 +328,143 @@ function CPU:execute(instruction)
             write(rd, a - b)
 
         elseif funct == 0x24 then
-            -- AND
             write(rd, bit.band(a, b))
 
         elseif funct == 0x25 then
-            -- OR
             write(rd, bit.bor(a, b))
 
         elseif funct == 0x26 then
-            -- XOR
             write(rd, bit.bxor(a, b))
 
         elseif funct == 0x27 then
-            -- NOR
             write(rd, bit.bnot(bit.bor(a, b)))
 
         elseif funct == 0x2A then
-            -- SLT
             write(rd, signed(a) < signed(b) and 1 or 0)
 
         elseif funct == 0x2B then
-            -- SLTU
             write(rd, unsigned(a) < unsigned(b) and 1 or 0)
 
         else
-            return nil, string.format(
-                "Unsupported SPECIAL instruction: funct=0x%02X at PC=0x%08X",
+            return unsupported(string.format(
+                "Unsupported SPECIAL funct=0x%02X at PC=0x%08X",
                 funct,
                 self.pc
-            )
+            ))
         end
 
-    -- =========================================================
-    -- JUMPS AND BRANCHES
-    -- =========================================================
-
+    -- JUMPS
     elseif op == 0x02 then
-        -- J
         next_branch = u32(
             bit.bor(
                 bit.band(self.pc + 4, 0xF0000000),
-                bit.lshift(bit.band(instruction, 0x03FFFFFF), 2)
+                bit.lshift(
+                    bit.band(instruction, 0x03FFFFFF),
+                    2
+                )
             )
         )
 
     elseif op == 0x03 then
-        -- JAL
         write(31, self.pc + 8)
 
         next_branch = u32(
             bit.bor(
                 bit.band(self.pc + 4, 0xF0000000),
-                bit.lshift(bit.band(instruction, 0x03FFFFFF), 2)
+                bit.lshift(
+                    bit.band(instruction, 0x03FFFFFF),
+                    2
+                )
             )
         )
 
     elseif op == 0x04 then
-        -- BEQ
         branchIf(a == b)
 
     elseif op == 0x05 then
-        -- BNE
         branchIf(a ~= b)
 
     elseif op == 0x06 then
-        -- BLEZ
         branchIf(signed(a) <= 0)
 
     elseif op == 0x07 then
-        -- BGTZ
         branchIf(signed(a) > 0)
 
     elseif op == 0x01 then
-        -- REGIMM
-
         if rt == 0x00 then
-            -- BLTZ
             branchIf(signed(a) < 0)
 
         elseif rt == 0x01 then
-            -- BGEZ
             branchIf(signed(a) >= 0)
 
         elseif rt == 0x10 then
-            -- BLTZAL
             if signed(a) < 0 then
                 write(31, self.pc + 8)
                 branchIf(true)
             end
 
         elseif rt == 0x11 then
-            -- BGEZAL
             if signed(a) >= 0 then
                 write(31, self.pc + 8)
                 branchIf(true)
             end
 
         else
-            return nil, string.format(
-                "Unsupported REGIMM instruction at PC=0x%08X",
-                self.pc
+            return unsupported(
+                "Unsupported REGIMM instruction"
             )
         end
 
-    -- =========================================================
     -- IMMEDIATE ARITHMETIC
-    -- =========================================================
-
     elseif op == 0x08 or op == 0x09 then
-        -- ADDI / ADDIU
         write(rt, a + simm)
 
     elseif op == 0x0A then
-        -- SLTI
         write(rt, signed(a) < simm and 1 or 0)
 
     elseif op == 0x0B then
-        -- SLTIU
         write(rt, unsigned(a) < unsigned(simm) and 1 or 0)
 
     elseif op == 0x0C then
-        -- ANDI
         write(rt, bit.band(a, imm))
 
     elseif op == 0x0D then
-        -- ORI
         write(rt, bit.bor(a, imm))
 
     elseif op == 0x0E then
-        -- XORI
         write(rt, bit.bxor(a, imm))
 
     elseif op == 0x0F then
-        -- LUI
         write(rt, bit.lshift(imm, 16))
 
-    -- =========================================================
     -- COP0
-    -- =========================================================
-
     elseif op == 0x10 then
 
         if rs == 0 then
-            -- MFC0
             write(rt, self.cop0[rd])
 
         elseif rs == 2 then
-            -- CFC0
             write(rt, self.cop0[rd])
 
         elseif rs == 4 then
-            -- MTC0
             self.cop0[rd] = u32(b)
 
         elseif rs == 6 then
-            -- CTC0
             self.cop0[rd] = u32(b)
 
         elseif rs == 8 then
-            -- BC0F / BC0T
-            local condition = bit.band(self.cop0[13], 1) ~= 0
+            local condition = bit.band(
+                self.cop0[13],
+                1
+            ) ~= 0
 
-            if rt == 0 and not condition then
-                branchIf(true)
-            elseif rt == 1 and condition then
-                branchIf(true)
+            if rt == 0 then
+                branchIf(not condition)
+            elseif rt == 1 then
+                branchIf(condition)
             end
 
         elseif rs == 16 then
-            -- COP0 operations
-
             if funct == 0x01 then
                 -- TLBR
 
@@ -496,30 +484,73 @@ function CPU:execute(instruction)
                 self.cop0[12] = u32(
                     bit.bor(
                         bit.band(status, 0xFFFFFFF0),
-                        bit.rshift(bit.band(status, 0x3C), 2)
+                        bit.rshift(
+                            bit.band(status, 0x3C),
+                            2
+                        )
                     )
                 )
 
             else
-                return nil, string.format(
-                    "Unsupported COP0 operation at PC=0x%08X",
-                    self.pc
+                return unsupported(
+                    "Unsupported COP0 operation"
                 )
             end
 
         else
-            return nil, string.format(
-                "Unsupported COP0 instruction at PC=0x%08X",
-                self.pc
+            return unsupported(
+                "Unsupported COP0 instruction"
             )
         end
 
-    -- =========================================================
-    -- LOAD INSTRUCTIONS
-    -- =========================================================
+    -- COP2 / GTE
+    elseif op == 0x12 then
 
+        if not self.gte then
+            return nil, nil, 11
+        end
+
+        if rs == 0 then
+            -- MFC2
+            write(rt, self.gte:readData(rd))
+
+        elseif rs == 2 then
+            -- CFC2
+            write(rt, self.gte:readControl(rd))
+
+        elseif rs == 4 then
+            -- MTC2
+            self.gte:writeData(rd, b)
+
+        elseif rs == 6 then
+            -- CTC2
+            self.gte:writeControl(rd, b)
+
+        elseif rs == 8 then
+            -- BC2F / BC2T
+            local flag = self.gte:readControl(31)
+            local condition = bit.band(flag, 0x80000000) ~= 0
+
+            if rt == 0 then
+                branchIf(not condition)
+            elseif rt == 1 then
+                branchIf(condition)
+            end
+
+        elseif rs >= 16 then
+            -- Comando GTE
+            local command = bit.band(instruction, 0x01FFFFFF)
+
+            self.gte:execute(command)
+
+        else
+            return unsupported(
+                "Unsupported COP2 instruction"
+            )
+        end
+
+    -- LOADS
     elseif op == 0x20 then
-        -- LB
         local value = self.memory:read8(address())
 
         if value >= 0x80 then
@@ -529,7 +560,6 @@ function CPU:execute(instruction)
         write(rt, value)
 
     elseif op == 0x21 then
-        -- LH
         local value = self.memory:read16(address())
 
         if value >= 0x8000 then
@@ -539,7 +569,6 @@ function CPU:execute(instruction)
         write(rt, value)
 
     elseif op == 0x22 then
-        -- LWL
         local addr = address()
         local aligned = bit.band(addr, 0xFFFFFFFC)
         local offset = bit.band(addr, 3)
@@ -570,19 +599,15 @@ function CPU:execute(instruction)
         end
 
     elseif op == 0x23 then
-        -- LW
         write(rt, self.memory:read32(address()))
 
     elseif op == 0x24 then
-        -- LBU
         write(rt, self.memory:read8(address()))
 
     elseif op == 0x25 then
-        -- LHU
         write(rt, self.memory:read16(address()))
 
     elseif op == 0x26 then
-        -- LWR
         local addr = address()
         local aligned = bit.band(addr, 0xFFFFFFFC)
         local offset = bit.band(addr, 3)
@@ -612,20 +637,14 @@ function CPU:execute(instruction)
             ))
         end
 
-    -- =========================================================
-    -- STORE INSTRUCTIONS
-    -- =========================================================
-
+    -- STORES
     elseif op == 0x28 then
-        -- SB
         self.memory:write8(address(), b)
 
     elseif op == 0x29 then
-        -- SH
         self.memory:write16(address(), b)
 
     elseif op == 0x2A then
-        -- SWL
         local addr = address()
         local aligned = bit.band(addr, 0xFFFFFFFC)
         local offset = bit.band(addr, 3)
@@ -658,11 +677,9 @@ function CPU:execute(instruction)
         self.memory:write32(aligned, newValue)
 
     elseif op == 0x2B then
-        -- SW
         self.memory:write32(address(), b)
 
     elseif op == 0x2E then
-        -- SWR
         local addr = address()
         local aligned = bit.band(addr, 0xFFFFFFFC)
         local offset = bit.band(addr, 3)
@@ -695,11 +712,11 @@ function CPU:execute(instruction)
         self.memory:write32(aligned, newValue)
 
     else
-        return nil, string.format(
-            "Unsupported opcode: 0x%02X at PC=0x%08X",
+        return unsupported(string.format(
+            "Unsupported opcode 0x%02X at PC=0x%08X",
             op,
             self.pc
-        )
+        ))
     end
 
     return next_branch
@@ -710,18 +727,26 @@ function CPU:step()
         return false, "CPU halted"
     end
 
-    local pc = self.pc
+    if self:checkInterrupt() then
+        self.cycles = self.cycles + 1
+        self.registers[0] = 0
+        return true
+    end
 
+    local pc = self.pc
     local instruction = self.memory:read32(pc)
 
     local previous_branch = self.pending_branch
     self.pending_branch = nil
 
-    local branch, err, exceptionCode = self:execute(instruction)
+    local branch, err, exceptionCode =
+        self:execute(instruction)
 
-    -- Excepciones solicitadas por instrucciones como SYSCALL y BREAK.
     if exceptionCode then
-        self:exception(exceptionCode, previous_branch ~= nil)
+        self:exception(
+            exceptionCode,
+            previous_branch ~= nil
+        )
 
         self.cycles = self.cycles + 1
         self.registers[0] = 0
@@ -729,24 +754,26 @@ function CPU:step()
         return true
     end
 
-    -- Instrucción no implementada.
     if err then
-        self.pc = pc
-        self:exception(10, previous_branch ~= nil)
+        self.last_error = err
+
+        self:exception(
+            10,
+            previous_branch ~= nil
+        )
 
         self.cycles = self.cycles + 1
+        self.registers[0] = 0
 
-        return false, err
+        -- La excepción es parte del flujo normal de la CPU.
+        -- El emulador puede continuar desde el vector de excepción.
+        return true, err
     end
 
-    -- Ejecutar el delay slot antes de cambiar al destino.
     self.pc = previous_branch or u32(pc + 4)
-
     self.pending_branch = branch
 
-    -- El registro cero siempre debe ser cero.
     self.registers[0] = 0
-
     self.cycles = self.cycles + 1
 
     return true
