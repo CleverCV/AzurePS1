@@ -1,35 +1,29 @@
 local bit = require("bit")
 
-local band = bit.band
-local bor = bit.bor
-local bxor = bit.bxor
-local lshift = bit.lshift
-local rshift = bit.rshift
-local tobit = bit.tobit
-
 local GTE = {}
 GTE.__index = GTE
 
-local function s16(value)
-    value = band(value, 0xFFFF)
-    if value >= 0x8000 then
-        return value - 0x10000
-    end
-    return value
+local function u32(v)
+    return bit.tobit(v)
 end
 
-local function clamp(value, minimum, maximum)
-    if value < minimum then return minimum end
-    if value > maximum then return maximum end
-    return value
+local function s16(v)
+    v = bit.band(v, 0xFFFF)
+    return v >= 0x8000 and v - 0x10000 or v
 end
 
-local function shift(value, amount)
-    return math.floor(value / (2 ^ amount))
+local function hi16(v)
+    return s16(bit.rshift(v, 16))
 end
 
-local function u32(value)
-    return tobit(value)
+local function lo16(v)
+    return s16(v)
+end
+
+local function clamp(v, low, high)
+    if v < low then return low end
+    if v > high then return high end
+    return v
 end
 
 function GTE.new()
@@ -38,13 +32,14 @@ function GTE.new()
     self.data = {}
     self.control = {}
 
-    self.cycles = 0
-    self.flag = 0
-
     for i = 0, 31 do
         self.data[i] = 0
         self.control[i] = 0
     end
+
+    self.cycles = 0
+    self.flags = 0
+    self.mac = {0, 0, 0, 0}
 
     return self
 end
@@ -56,522 +51,346 @@ function GTE:reset()
     end
 
     self.cycles = 0
-    self.flag = 0
+    self.flags = 0
 end
 
 function GTE:readData(index)
-    index = band(index, 31)
-
-    if index == 15 then
-        return u32(self.data[14])
-    end
-
-    if index == 28 then
-        local r = band(self.data[9], 0x1F)
-        local g = band(self.data[10], 0x1F)
-        local b = band(self.data[11], 0x1F)
-
-        return bor(
-            r,
-            lshift(g, 5),
-            lshift(b, 10)
-        )
-    end
-
-    if index == 29 then
-        return u32(self.data[28])
-    end
-
-    if index == 31 then
-        return u32(self.data[31])
-    end
-
-    return u32(self.data[index] or 0)
-end
-
-function GTE:writeData(index, value)
-    index = band(index, 31)
-    value = u32(value)
+    index = bit.band(index, 31)
 
     if index == 15 then
         self.data[12] = self.data[13]
         self.data[13] = self.data[14]
-        self.data[14] = value
-
-    elseif index == 28 then
-        self.data[28] = value
-
-        local rgb = band(value, 0x7FFF)
-
-        self.data[9] = band(rgb, 31) * 0x400
-        self.data[10] = band(rshift(rgb, 5), 31) * 0x400
-        self.data[11] = band(rshift(rgb, 10), 31) * 0x400
-
-    elseif index == 30 then
-        self.data[30] = value
-
-        local v = value
-        local count = 0
-
-        if v < 0 then
-            v = bxor(v, -1)
-        end
-
-        for i = 31, 0, -1 do
-            if band(rshift(v, i), 1) ~= 0 then
-                break
-            end
-
-            count = count + 1
-        end
-
-        self.data[31] = count
-
-    elseif index == 31 then
-        -- LZCR es de solo lectura.
-
-    else
-        self.data[index] = value
     end
+
+    if index == 28 then
+        return bit.bor(
+            bit.band(bit.rshift(self.data[9] or 0, 7), 0x7C00),
+            bit.band(bit.rshift(self.data[10] or 0, 2), 0x03E0),
+            bit.band(bit.rshift(self.data[11] or 0, 7), 0x001F)
+        )
+    end
+
+    if index == 29 then
+        return bit.bor(
+            bit.band(bit.rshift(self.data[9] or 0, 12), 0x1F),
+            bit.band(bit.rshift(self.data[10] or 0, 7), 0x03E0),
+            bit.band(bit.rshift(self.data[11] or 0, 2), 0x7C00)
+        )
+    end
+
+    return self.data[index] or 0
+end
+
+function GTE:writeData(index, value)
+    index = bit.band(index, 31)
+    value = u32(value)
+
+    if index == 15 then
+        self.data[14] = value
+        self.data[12] = self.data[13]
+        self.data[13] = self.data[14]
+        return
+    end
+
+    if index == 28 or index == 29 then
+        local r = bit.band(value, 0x1F)
+        local g = bit.band(bit.rshift(value, 5), 0x1F)
+        local b = bit.band(bit.rshift(value, 10), 0x1F)
+
+        self.data[9] = bit.bor(
+            bit.band(self.data[9], 0xFFFF0000),
+            bit.lshift(r, 7)
+        )
+        self.data[10] = bit.bor(
+            bit.band(self.data[10], 0xFFFF0000),
+            bit.lshift(g, 7)
+        )
+        self.data[11] = bit.bor(
+            bit.band(self.data[11], 0xFFFF0000),
+            bit.lshift(b, 7)
+        )
+        return
+    end
+
+    self.data[index] = value
 end
 
 function GTE:readControl(index)
-    index = band(index, 31)
-
-    if index == 31 then
-        return u32(self.flag)
-    end
-
-    return u32(self.control[index] or 0)
+    return self.control[bit.band(index, 31)] or 0
 end
 
 function GTE:writeControl(index, value)
-    index = band(index, 31)
+    index = bit.band(index, 31)
     value = u32(value)
 
     if index == 31 then
-        self.flag = band(value, 0x7FFFF000)
-        self.data[31] = self.flag
+        self.flags = bit.band(value, 0x7FFFF000)
+        self.control[31] = self.flags
     else
         self.control[index] = value
     end
 end
 
-function GTE:_begin()
-    self.flag = 0
+function GTE:setFlag(flag)
+    self.flags = bit.bor(self.flags, flag)
 end
 
-function GTE:_finish()
-    if band(self.flag, 0x7F87E000) ~= 0 then
-        self.flag = bor(self.flag, 0x80000000)
+function GTE:finishFlags()
+    local f = self.flags
+
+    if bit.band(f, 0x7F87E000) ~= 0 then
+        f = bit.bor(f, 0x80000000)
     end
 
-    self.data[31] = self.flag
+    self.flags = bit.band(f, 0x7FFFF000)
+    self.control[31] = self.flags
 end
 
-function GTE:_setMAC(index, value)
-    if value > 2147483647 then
-        self.flag = bor(
-            self.flag,
-            lshift(1, 30 - index)
-        )
-    elseif value < -2147483648 then
-        self.flag = bor(
-            self.flag,
-            lshift(1, 27 - index)
-        )
-    end
-
-    self.data[24 + index] = u32(value)
-end
-
-function GTE:_setIR(index, value, lm)
-    local minimum = lm and 0 or -32768
-
-    if value < minimum or value > 32767 then
-        self.flag = bor(
-            self.flag,
-            lshift(1, 25 - index)
-        )
-    end
-
-    self.data[8 + index] = clamp(value, minimum, 32767)
-end
-
-function GTE:_vector(index)
-    local xy = self.data[index * 2] or 0
-    local z = self.data[index * 2 + 1] or 0
-
-    return {
-        s16(band(xy, 0xFFFF)),
-        s16(rshift(xy, 16)),
-        s16(band(z, 0xFFFF))
-    }
-end
-
-function GTE:_matrix(base)
-    local matrix = {
-        {0, 0, 0},
-        {0, 0, 0},
-        {0, 0, 0}
-    }
-
-    for row = 1, 3 do
-        for column = 1, 3 do
-            local element = (row - 1) * 3 + column - 1
-            local register = base + math.floor(element / 2)
-            local packed = self.control[register] or 0
-
-            if element == 8 then
-                matrix[row][column] = s16(band(packed, 0xFFFF))
-            elseif element % 2 == 0 then
-                matrix[row][column] = s16(band(packed, 0xFFFF))
-            else
-                matrix[row][column] = s16(rshift(packed, 16))
-            end
-        end
-    end
-
-    return matrix
-end
-
-function GTE:_translation(base)
-    return {
-        tobit(self.control[base] or 0),
-        tobit(self.control[base + 1] or 0),
-        tobit(self.control[base + 2] or 0)
-    }
-end
-
-function GTE:_multiply(matrix, vector, translation, sf, lm)
-    local amount = sf and 12 or 0
-
-    for i = 1, 3 do
-        local result =
-            translation[i] * 4096
-            + matrix[i][1] * vector[1]
-            + matrix[i][2] * vector[2]
-            + matrix[i][3] * vector[3]
-
-        result = shift(result, amount)
-
-        self:_setMAC(i, result)
-        self:_setIR(i, result, lm)
-    end
-end
-
-function GTE:_setSZ(value)
-    if value < 0 or value > 65535 then
-        self.flag = bor(self.flag, lshift(1, 18))
-    end
-
-    self.data[16] = self.data[17]
-    self.data[17] = self.data[18]
-    self.data[18] = self.data[19]
-    self.data[19] = clamp(value, 0, 65535)
-end
-
-function GTE:_setSXY(x, y)
-    local sx = clamp(x, -1024, 1023)
-    local sy = clamp(y, -1024, 1023)
-
-    if sx ~= x then
-        self.flag = bor(self.flag, lshift(1, 14))
-    end
-
-    if sy ~= y then
-        self.flag = bor(self.flag, lshift(1, 13))
-    end
-
+function GTE:pushSXY(x, y)
     self.data[12] = self.data[13]
     self.data[13] = self.data[14]
 
-    self.data[14] = u32(
-        bor(
-            band(sx, 0xFFFF),
-            lshift(band(sy, 0xFFFF), 16)
-        )
+    local sx = clamp(x, -1024, 1023)
+    local sy = clamp(y, -1024, 1023)
+
+    self.data[14] = u32(bit.bor(
+        bit.band(sx, 0xFFFF),
+        bit.lshift(bit.band(sy, 0xFFFF), 16)
+    ))
+end
+
+function GTE:pushSZ(value)
+    self.data[16] = self.data[17]
+    self.data[17] = self.data[18]
+    self.data[18] = self.data[19]
+    self.data[19] = u32(clamp(value, 0, 65535))
+end
+
+function GTE:pushRGB(r, g, b, code)
+    self.data[20] = self.data[21]
+    self.data[21] = self.data[22]
+
+    self.data[22] = u32(
+        bit.band(r, 255) +
+        bit.lshift(bit.band(g, 255), 8) +
+        bit.lshift(bit.band(b, 255), 16) +
+        bit.lshift(bit.band(code or 0, 255), 24)
     )
 end
 
-function GTE:_rtps(vectorIndex, sf, lm)
-    local matrix = self:_matrix(0)
-    local vector = self:_vector(vectorIndex)
-    local translation = self:_translation(5)
+function GTE:transformVertex(index, sf, lm)
+    local vx = s16(self.data[index] or 0)
+    local vy = hi16(self.data[index] or 0)
+    local vz = s16(self.data[index + 1] or 0)
 
-    self:_multiply(
-        matrix,
-        vector,
-        translation,
-        sf,
-        lm
-    )
-
-    local depth = self.data[27]
-
-    self:_setSZ(
-        shift(depth, sf and 0 or 12)
-    )
-
-    local h = band(self.control[26] or 0, 0xFFFF)
-    local sz = self.data[19]
-
-    local quotient
-
-    if sz == 0 then
-        quotient = 0x1FFFF
-        self.flag = bor(self.flag, lshift(1, 17))
-    else
-        quotient = math.floor(
-            (h * 0x20000 / sz + 1) / 2
-        )
-
-        if quotient > 0x1FFFF then
-            quotient = 0x1FFFF
-            self.flag = bor(self.flag, lshift(1, 17))
-        end
-    end
-
-    local sx = shift(
-        (self.control[24] or 0) + quotient * self.data[9],
-        16
-    )
-
-    local sy = shift(
-        (self.control[25] or 0) + quotient * self.data[10],
-        16
-    )
-
-    self:_setSXY(sx, sy)
-
-    local dqa = s16(self.control[27] or 0)
-    local dqb = tobit(self.control[28] or 0)
-
-    local ir0 = shift(
-        quotient * dqa + dqb,
-        12
-    )
-
-    if ir0 < 0 or ir0 > 4096 then
-        self.flag = bor(self.flag, lshift(1, 12))
-    end
-
-    self.data[8] = clamp(ir0, 0, 4096)
-end
-
-function GTE:_nclip()
-    local function getXY(index)
-        local value = self.data[index]
-
-        return
-            s16(band(value, 0xFFFF)),
-            s16(rshift(value, 16))
-    end
-
-    local x0, y0 = getXY(12)
-    local x1, y1 = getXY(13)
-    local x2, y2 = getXY(14)
-
-    self.data[24] = u32(
-        x0 * y1
-        + x1 * y2
-        + x2 * y0
-        - x0 * y2
-        - x1 * y0
-        - x2 * y1
-    )
-end
-
-function GTE:_op(sf)
-    local matrix = self:_matrix(0)
-
-    local x = self.data[9]
-    local y = self.data[10]
-    local z = self.data[11]
-
-    local values = {
-        z * matrix[2][2] - y * matrix[1][1],
-        x * matrix[1][1] - z * matrix[2][2],
-        y * matrix[2][2] - x * matrix[1][1]
+    local rotation = {
+        {s16(self.control[0]), hi16(self.control[0]), s16(self.control[1])},
+        {hi16(self.control[1]), s16(self.control[2]), hi16(self.control[2])},
+        {s16(self.control[3]), hi16(self.control[3]), s16(self.control[4])}
     }
 
-    for i = 1, 3 do
-        local result = shift(values[i], sf and 12 or 0)
+    -- The PS1 stores the rotation matrix in packed halfwords.
+    local m = {
+        {s16(self.control[0]), hi16(self.control[0]), s16(self.control[1])},
+        {hi16(self.control[1]), s16(self.control[2]), hi16(self.control[2])},
+        {s16(self.control[3]), hi16(self.control[3]), s16(self.control[4])}
+    }
 
-        self:_setMAC(i, result)
-        self:_setIR(i, result, false)
+    local tx = self.control[5]
+    local ty = self.control[6]
+    local tz = self.control[7]
+
+    local x = tx + m[1][1] * vx + m[1][2] * vy + m[1][3] * vz
+    local y = ty + m[2][1] * vx + m[2][2] * vy + m[2][3] * vz
+    local z = tz + m[3][1] * vx + m[3][2] * vy + m[3][3] * vz
+
+    if lm then
+        x = math.max(0, x)
+        y = math.max(0, y)
+        z = math.max(0, z)
     end
+
+    if sf then
+        x = math.floor(x / 65536)
+        y = math.floor(y / 65536)
+        z = math.floor(z / 65536)
+    end
+
+    self.mac[1], self.mac[2], self.mac[3] = x, y, z
+
+    self.data[25] = u32(x)
+    self.data[26] = u32(y)
+    self.data[27] = u32(z)
+
+    self:pushSZ(z)
+    return x, y, z
 end
 
-function GTE:_mvmva(command)
-    local mx = band(rshift(command, 17), 3)
-    local vectorSelect = band(rshift(command, 15), 3)
-    local translationSelect = band(rshift(command, 13), 3)
+function GTE:projectVertex(index, sf, lm)
+    local _, _, z = self:transformVertex(index, sf, lm)
 
-    local sf = band(command, lshift(1, 19)) ~= 0
-    local lm = band(command, lshift(1, 10)) ~= 0
+    local h = bit.band(self.control[26], 0xFFFF)
+    if h == 0 then h = 1 end
 
-    local matrixBases = {0, 8, 16}
-    local translationBases = {5, 13, 21}
+    local factor = h / math.max(1, z)
+    local x = math.floor(self.mac[1] * factor)
+    local y = math.floor(self.mac[2] * factor)
 
-    local matrix = self:_matrix(matrixBases[mx + 1] or 0)
+    local ofx = self.control[24]
+    local ofy = self.control[25]
 
-    local vector
+    local sx = math.floor(ofx / 65536) + x
+    local sy = math.floor(ofy / 65536) + y
 
-    if vectorSelect == 3 then
-        vector = {
-            self.data[9],
-            self.data[10],
-            self.data[11]
-        }
-    else
-        vector = self:_vector(vectorSelect)
-    end
+    local dqa = s16(self.control[27])
+    local dqb = self.control[28]
+    local depth = math.floor(dqb + dqa * factor)
 
-    local translation
+    self.data[8] = u32(depth)
+    self:pushSXY(sx, sy)
 
-    if translationSelect == 3 then
-        translation = {0, 0, 0}
-    else
-        translation = self:_translation(
-            translationBases[translationSelect + 1]
-        )
-    end
-
-    self:_multiply(
-        matrix,
-        vector,
-        translation,
-        sf,
-        lm
-    )
+    return sx, sy, z
 end
 
-function GTE:_sqr(sf, lm)
-    for i = 1, 3 do
-        local value = self.data[8 + i]
-        local result = shift(value * value, sf and 12 or 0)
-
-        self:_setMAC(i, result)
-        self:_setIR(i, result, lm)
-    end
+function GTE:rtps(sf, lm)
+    self.flags = 0
+    self:projectVertex(0, sf, lm)
+    self:finishFlags()
 end
 
-function GTE:_avsz(count)
-    local sum
-
-    if count == 3 then
-        sum =
-            self.data[17]
-            + self.data[18]
-            + self.data[19]
-    else
-        sum =
-            self.data[16]
-            + self.data[17]
-            + self.data[18]
-            + self.data[19]
-    end
-
-    local scale = s16(
-        self.control[count == 3 and 29 or 30] or 0
-    )
-
-    local result = sum * scale
-
-    self.data[24] = u32(result)
-
-    local otz = shift(result, 12)
-
-    if otz < 0 or otz > 65535 then
-        self.flag = bor(self.flag, lshift(1, 18))
-    end
-
-    self.data[7] = clamp(otz, 0, 65535)
+function GTE:rtpt(sf, lm)
+    self.flags = 0
+    self:projectVertex(0, sf, lm)
+    self:projectVertex(2, sf, lm)
+    self:projectVertex(4, sf, lm)
+    self:finishFlags()
 end
 
-function GTE:_gpf(sf, lm, addBase)
-    local amount = sf and 12 or 0
+function GTE:nclip()
+    local x0 = s16(self.data[12])
+    local y0 = hi16(self.data[12])
+    local x1 = s16(self.data[13])
+    local y1 = hi16(self.data[13])
+    local x2 = s16(self.data[14])
+    local y2 = hi16(self.data[14])
 
-    for i = 1, 3 do
-        local base = 0
+    local value = x0 * y1 + x1 * y2 + x2 * y0 -
+        x0 * y2 - x1 * y0 - x2 * y1
 
-        if addBase then
-            base = self.data[24 + i]
-        end
+    self.data[24] = u32(value)
+    self.mac[0] = value
+end
 
-        local result = shift(
-            self.data[8] * self.data[8 + i] + base,
-            amount
-        )
+function GTE:avsz3()
+    local z = (self.data[17] or 0) +
+        (self.data[18] or 0) +
+        (self.data[19] or 0)
 
-        self:_setMAC(i, result)
-        self:_setIR(i, result, lm)
-    end
+    local zsf = s16(self.control[29])
+    self.data[7] = u32(math.floor(z * zsf / 4096))
+    self.data[OTZ] = self.data[7]
+end
+
+function GTE:avsz4()
+    local z = (self.data[16] or 0) +
+        (self.data[17] or 0) +
+        (self.data[18] or 0) +
+        (self.data[19] or 0)
+
+    local zsf = s16(self.control[30])
+    self.data[7] = u32(math.floor(z * zsf / 4096))
 end
 
 function GTE:execute(command)
-    command = u32(command)
+    local fn = bit.band(command, 0x3F)
+    local sf = bit.band(command, 0x00080000) ~= 0
+    local lm = bit.band(command, 0x00040000) ~= 0
 
-    local opcode = band(command, 0x3F)
-    local sf = band(command, lshift(1, 19)) ~= 0
-    local lm = band(command, lshift(1, 10)) ~= 0
+    self.cycles = self.cycles + 1
 
-    self:_begin()
+    if fn == 0x01 then
+        self:rtps(sf, lm)
 
-    if opcode == 0x01 then
-        self:_rtps(0, sf, lm)
-        self.cycles = self.cycles + 15
+    elseif fn == 0x06 then
+        self:nclip()
 
-    elseif opcode == 0x30 then
-        self:_rtps(0, sf, lm)
-        self:_rtps(1, sf, lm)
-        self:_rtps(2, sf, lm)
-        self.cycles = self.cycles + 23
+    elseif fn == 0x0C then
+        -- OP: outer product.
+        local vx = s16(self.data[0])
+        local vy = hi16(self.data[0])
+        local vz = s16(self.data[1])
 
-    elseif opcode == 0x06 then
-        self:_nclip()
-        self.cycles = self.cycles + 8
+        local r = {
+            s16(self.control[0]), s16(self.control[2]), s16(self.control[4])
+        }
 
-    elseif opcode == 0x0C then
-        self:_op(sf)
-        self.cycles = self.cycles + 6
+        local x = r[2] * vz - r[3] * vy
+        local y = r[3] * vx - r[1] * vz
+        local z = r[1] * vy - r[2] * vx
 
-    elseif opcode == 0x12 then
-        self:_mvmva(command)
-        self.cycles = self.cycles + 8
+        if sf then
+            x, y, z = math.floor(x / 65536),
+                math.floor(y / 65536), math.floor(z / 65536)
+        end
 
-    elseif opcode == 0x28 then
-        self:_sqr(sf, lm)
-        self.cycles = self.cycles + 5
+        self.data[25], self.data[26], self.data[27] =
+            u32(x), u32(y), u32(z)
 
-    elseif opcode == 0x2D then
-        self:_avsz(3)
-        self.cycles = self.cycles + 5
+    elseif fn == 0x10 then
+        self:execute(bit.bor(command, 0x10))
 
-    elseif opcode == 0x2E then
-        self:_avsz(4)
-        self.cycles = self.cycles + 6
+    elseif fn == 0x11 then
+        -- SQR
+        for i = 1, 3 do
+            local v = s32(self.data[24 + i])
+            local result = v * v
+            if sf then result = math.floor(result / 65536) end
+            self.data[24 + i] = u32(result)
+        end
 
-    elseif opcode == 0x3D then
-        self:_gpf(sf, lm, false)
-        self.cycles = self.cycles + 5
+    elseif fn == 0x12 then
+        -- DCPL: approximate depth cue interpolation.
+        local r = bit.band(self.data[6], 0xFF)
+        local g = bit.band(bit.rshift(self.data[6], 8), 0xFF)
+        local b = bit.band(bit.rshift(self.data[6], 16), 0xFF)
+        self:pushRGB(r, g, b, bit.rshift(self.data[6], 24))
 
-    elseif opcode == 0x3E then
-        self:_gpf(sf, lm, true)
-        self.cycles = self.cycles + 5
-
-    else
-        self:_finish()
-        return false, string.format(
-            "GTE command 0x%02X is not implemented",
-            opcode
+    elseif fn == 0x13 then
+        -- INTPL
+        self:pushRGB(
+            bit.band(self.data[6], 255),
+            bit.band(bit.rshift(self.data[6], 8), 255),
+            bit.band(bit.rshift(self.data[6], 16), 255),
+            bit.rshift(self.data[6], 24)
         )
+
+    elseif fn == 0x2D then
+        self:avsz3()
+
+    elseif fn == 0x2E then
+        self:avsz4()
+
+    elseif fn == 0x30 then
+        self:rtpt(sf, lm)
+
+    elseif fn == 0x3D then
+        -- GPF
+        for i = 1, 3 do
+            local value = s32(self.data[24 + i])
+            if sf then value = math.floor(value / 65536) end
+            self.data[24 + i] = u32(value)
+        end
+
+    elseif fn == 0x3E then
+        -- GPL
+        for i = 1, 3 do
+            self.data[24 + i] = u32(
+                self.data[24 + i] + self.mac[i]
+            )
+        end
     end
 
-    self:_finish()
-
-    return true
+    self:finishFlags()
 end
 
 return GTE
