@@ -3,6 +3,7 @@ local Memory = require("core.memory")
 local BIOS = require("core.bios")
 local CPU = require("core.cpu")
 local GTE = require("core.gte")
+local SPU = require("core.spu")
 local Interrupts = require("core.interrupts")
 local GPU = require("core.gpu")
 
@@ -24,39 +25,24 @@ end
 function Core.new()
     local self = setmetatable({}, Core)
 
-    -- Sistema de interrupciones.
     self.interrupts = Interrupts.new()
-
-    -- Memoria principal.
     self.memory = Memory.new()
-
-    -- GPU.
     self.gpu = GPU.new(self.interrupts)
-
-    if type(self.memory.setGPU) == "function" then
-        self.memory:setGPU(self.gpu)
-    end
-
-    -- Conectar interrupciones al bus si la memoria lo soporta.
-    if type(self.memory.setInterrupts) == "function" then
-        self.memory:setInterrupts(self.interrupts)
-    end
-
-    -- Geometry Transformation Engine.
     self.gte = GTE.new()
+    self.spu = SPU.new()
 
-    -- CPU MIPS R3000A.
+    self.memory:setGPU(self.gpu)
+    self.memory:setSPU(self.spu)
+    self.memory:setInterrupts(self.interrupts)
+
     self.cpu = CPU.new(
         self.memory,
         self.interrupts,
         self.gte
     )
 
-    if type(self.cpu.setGTE) == "function" then
-        self.cpu:setGTE(self.gte)
-    end
+    self.cpu:setGTE(self.gte)
 
-    -- Estado del sistema.
     self.running = false
     self.bios_loaded = false
 
@@ -73,7 +59,6 @@ function Core.new()
     self.exception_count = 0
     self.consecutive_exception_count = 0
     self.last_exception_pc = nil
-
     self.max_consecutive_exceptions = 100
 
     print("[AzurePS1] Core initialized")
@@ -81,6 +66,7 @@ function Core.new()
     print("[AzurePS1] Interrupt controller connected")
     print("[AzurePS1] GPU connected")
     print("[AzurePS1] GTE connected")
+    print("[AzurePS1] SPU connected")
     print("[AzurePS1] CPU connected")
 
     return self
@@ -91,17 +77,12 @@ function Core:loadBIOS(path)
         self:stop()
     end
 
-    local success, err = BIOS.initialize(
-        self.memory,
-        path
-    )
+    local success, err = BIOS.initialize(self.memory, path)
 
     if not success then
         self.bios_loaded = false
         self.last_error = tostring(err)
-
         print("[BIOS ERROR] " .. self.last_error)
-
         return false, err
     end
 
@@ -122,28 +103,22 @@ function Core:reset()
 
     self.running = false
 
-    -- Reiniciar dispositivos en orden.
-    local ok, err = safeCall(self.interrupts, "reset")
-    if not ok then
-        return false, "Interrupt reset failed: " .. tostring(err)
+    local devices = {
+        {self.interrupts, "reset"},
+        {self.gpu, "reset"},
+        {self.gte, "reset"},
+        {self.spu, "reset"},
+        {self.cpu, "reset"}
+    }
+
+    for _, entry in ipairs(devices) do
+        local ok, err = safeCall(entry[1], entry[2])
+
+        if not ok then
+            return false, entry[2] .. " failed: " .. tostring(err)
+        end
     end
 
-    ok, err = safeCall(self.gpu, "reset")
-    if not ok then
-        return false, "GPU reset failed: " .. tostring(err)
-    end
-
-    ok, err = safeCall(self.gte, "reset")
-    if not ok then
-        return false, "GTE reset failed: " .. tostring(err)
-    end
-
-    ok, err = safeCall(self.cpu, "reset")
-    if not ok then
-        return false, "CPU reset failed: " .. tostring(err)
-    end
-
-    -- Estado inicial del procesador PS1.
     self.cpu.pc = 0xBFC00000
     self.cpu.halted = false
     self.cpu.running = false
@@ -154,7 +129,6 @@ function Core:reset()
 
     self.last_error = nil
     self.last_exception = nil
-
     self.exception_count = 0
     self.consecutive_exception_count = 0
     self.last_exception_pc = nil
@@ -184,11 +158,7 @@ function Core:start()
     self.cpu.running = true
 
     print("[AzurePS1] Emulation started")
-
-    print(string.format(
-        "[CPU] PC: 0x%08X",
-        self.cpu.pc
-    ))
+    print(string.format("[CPU] PC: 0x%08X", self.cpu.pc))
 
     return true
 end
@@ -214,8 +184,7 @@ end
 function Core:handleCPUException(message)
     local faultPC = self:getFaultPC()
 
-    self.exception_count =
-        self.exception_count + 1
+    self.exception_count = self.exception_count + 1
 
     if self.last_exception_pc == faultPC then
         self.consecutive_exception_count =
@@ -231,25 +200,22 @@ function Core:handleCPUException(message)
         count = self.consecutive_exception_count
     }
 
-    -- Una excepción MIPS válida debe transferir el control
-    -- al vector de excepción, no apagar el emulador.
+    -- El CPU ya debe haber saltado al vector de excepción.
     if self.cpu.pc == Core.EXCEPTION_VECTOR then
         if self.consecutive_exception_count >
-            self.max_consecutive_exceptions then
-
+        self.max_consecutive_exceptions then
             self.last_error =
                 "Repeated CPU exception at PC 0x" ..
                 string.format("%08X", faultPC)
 
             print("[CPU FATAL] " .. self.last_error)
-
             self:stop()
             return false, self.last_error
         end
 
         if self.consecutive_exception_count == 1 then
             print(string.format(
-                "[CPU EXCEPTION] PC=0x%08X: %s",
+                "[CPU EXCEPTION] EPC=0x%08X: %s",
                 faultPC,
                 tostring(message)
             ))
@@ -267,7 +233,6 @@ function Core:handleCPUException(message)
     ))
 
     self:stop()
-
     return false, self.last_error
 end
 
@@ -283,13 +248,11 @@ function Core:step()
     if self.cpu.halted then
         self.last_error = "CPU halted"
         self:stop()
-
         return false, self.last_error
     end
 
     local oldPC = self.cpu.pc
 
-    -- Proteger el bucle principal ante errores Lua.
     local callOK, success, err = pcall(
         self.cpu.step,
         self.cpu
@@ -305,7 +268,6 @@ function Core:step()
         ))
 
         self:stop()
-
         return false, self.last_error
     end
 
@@ -321,20 +283,12 @@ function Core:step()
         self.last_exception_pc = nil
     end
 
-    -- Actualizar GPU.
-    local gpuOK, gpuError = safeCall(
-        self.gpu,
-        "update",
-        1
-    )
+    local gpuOK, gpuError = safeCall(self.gpu, "update", 1)
 
     if not gpuOK then
         self.last_error = tostring(gpuError)
-
         print("[GPU ERROR] " .. self.last_error)
-
         self:stop()
-
         return false, self.last_error
     end
 
@@ -352,8 +306,7 @@ function Core:run(instruction_count)
     instruction_count = math.max(
         1,
         math.floor(
-            instruction_count or
-            self.instructions_per_frame
+            instruction_count or self.instructions_per_frame
         )
     )
 
@@ -369,22 +322,28 @@ function Core:run(instruction_count)
 end
 
 function Core:update(dt)
-    if not self.running then
+    if type(dt) ~= "number" or dt < 0 then
         return
     end
 
-    if type(dt) ~= "number" or dt < 0 then
+    if not self.running then
         return
     end
 
     self.elapsed_time = self.elapsed_time + dt
 
-    local budget = self.instructions_per_frame
-
-    local success, err = self:run(budget)
+    local success, err = self:run(self.instructions_per_frame)
 
     if not success and err then
         print("[CORE ERROR] " .. tostring(err))
+    end
+
+    -- El SPU genera muestras para el frontend de audio.
+    local spuOK, spuError = safeCall(self.spu, "update", dt)
+
+    if not spuOK then
+        self.last_error = tostring(spuError)
+        print("[SPU ERROR] " .. self.last_error)
     end
 end
 
@@ -393,14 +352,11 @@ function Core:getCPUState()
         pc = self.cpu.pc,
         hi = self.cpu.hi,
         lo = self.cpu.lo,
-
         cycles = self.cpu.cycles,
         registers = self.cpu.registers,
         cop0 = self.cpu.cop0,
-
         running = self.running,
         halted = self.cpu.halted,
-
         exception_count = self.exception_count,
         last_exception = self.last_exception
     }
@@ -410,10 +366,8 @@ function Core:getGPUState()
     return {
         width = self.gpu.vram_width,
         height = self.gpu.vram_height,
-
         display_enabled = self.gpu.display_enabled,
         cycles = self.gpu.cycles,
-
         command_count = #self.gpu.command_buffer
     }
 end
@@ -423,6 +377,22 @@ function Core:getGTEState()
         cycles = self.gte.cycles,
         data = self.gte.data,
         control = self.gte.control
+    }
+end
+
+function Core:getSPUState()
+    local active = 0
+
+    for i = 1, 24 do
+        if self.spu.voices[i].active then
+            active = active + 1
+        end
+    end
+
+    return {
+        enabled = self.spu.enabled,
+        active_voices = active,
+        sample_rate = self.spu.sample_rate
     }
 end
 

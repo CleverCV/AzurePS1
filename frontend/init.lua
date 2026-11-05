@@ -1,6 +1,7 @@
 
 local Interface = require("frontend.interface")
 local Renderer = require("frontend.renderer")
+local Audio = require("frontend.audio")
 
 local Frontend = {}
 Frontend.__index = Frontend
@@ -11,6 +12,7 @@ function Frontend.new(core)
     self.core = core
     self.interface = Interface.new()
     self.renderer = Renderer.new()
+    self.audio = Audio.new()
     self.gpu = core.gpu
 
     self.initialized = true
@@ -18,6 +20,7 @@ function Frontend.new(core)
 
     print("[Frontend] Interface initialized")
     print("[Frontend] Renderer initialized")
+    print("[Frontend] Audio initialized")
     print("[Frontend] GPU connected:", self.gpu ~= nil)
     print("[Frontend] Frontend ready")
 
@@ -27,18 +30,21 @@ end
 function Frontend:update(dt)
     if not self.initialized then return end
 
-    -- La ventana conserva su tamaño normal.
-    -- No se activa el modo fullscreen.
+    if self.core and self.core.running then
+        self.audio:update(dt, self.core.spu)
+        self.wasRunning = true
+    elseif self.wasRunning then
+        self.audio:stop()
+        self.wasRunning = false
+    end
 end
 
 function Frontend:draw()
     if not self.initialized then return end
 
     if self.core and self.core.running then
-        -- Dibujar la imagen de la GPU en toda la ventana.
         self.renderer:draw(self.gpu)
     else
-        -- Mostrar la interfaz cuando el emulador está detenido.
         self.interface:draw(self.core)
     end
 end
@@ -46,7 +52,6 @@ end
 function Frontend:mousepressed(x, y, button)
     if not self.initialized then return end
 
-    -- No enviar clics a la interfaz durante la emulación.
     if self.core and self.core.running then
         return
     end
@@ -65,6 +70,8 @@ function Frontend:keypressed(key)
     if key == "f1" then
         if self.core.running then
             self.core:stop()
+            self.audio:stop()
+            self.wasRunning = false
             print("[Frontend] Emulation stopped")
         else
             local success, err = self.core:start()
@@ -80,6 +87,20 @@ end
 
 function Frontend:setPage(page)
     self.interface:setPage(page)
+end
+
+function Frontend:setAudioEnabled(enabled)
+    self.audio:setEnabled(enabled)
+end
+
+function Frontend:setAudioVolume(volume)
+    self.audio:setVolume(volume)
+end
+
+function Frontend:shutdown()
+    if self.audio then
+        self.audio:destroy()
+    end
 end
 
 return Frontend
